@@ -125,7 +125,7 @@ int sys_enter_init(struct bpf_raw_tracepoint_args *ctx)
     // exit, exit_group and rt_sigreturn syscalls don't return
     if (sys->id != SYSCALL_EXIT && sys->id != SYSCALL_EXIT_GROUP &&
         sys->id != SYSCALL_RT_SIGRETURN) {
-        sys->ts = bpf_ktime_get_ns();
+        sys->ts = get_current_time_in_ns();
         task_info->syscall_traced = true;
     }
 
@@ -676,20 +676,20 @@ int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 
     // Process tree information (if needed).
     if (p.config->options & OPT_FORK_PROCTREE) {
-        // Both, the thread group leader and the "up_parent" (the first process, not lwp, found
+        // Both, the thread group leader and the "parent_process" (the first process, not lwp, found
         // as a parent of the child in the hierarchy), are needed by the userland process tree.
         // The userland process tree default source of events is the signal events, but there is
         // an option to use regular event for maintaining it as well (and it is needed for some
         // situatins). These arguments will always be removed by userland event processors.
         struct task_struct *leader = get_leader_task(child);
-        struct task_struct *up_parent = get_leader_task(get_parent_task(leader));
+        struct task_struct *parent_process = get_leader_task(get_parent_task(leader));
 
-        // Up Parent information: Go up in hierarchy until parent is process.
-        u64 up_parent_start_time = get_task_start_time(up_parent);
-        int up_parent_pid = get_task_host_tgid(up_parent);
-        int up_parent_tid = get_task_host_pid(up_parent);
-        int up_parent_ns_pid = get_task_ns_tgid(up_parent);
-        int up_parent_ns_tid = get_task_ns_pid(up_parent);
+        // Parent Process information: Go up in hierarchy until parent is process.
+        u64 parent_process_start_time = get_task_start_time(parent_process);
+        int parent_process_pid = get_task_host_tgid(parent_process);
+        int parent_process_tid = get_task_host_pid(parent_process);
+        int parent_process_ns_pid = get_task_ns_tgid(parent_process);
+        int parent_process_ns_tid = get_task_ns_pid(parent_process);
         // Leader information.
         u64 leader_start_time = get_task_start_time(leader);
         int leader_pid = get_task_host_tgid(leader);
@@ -698,11 +698,12 @@ int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
         int leader_ns_tid = get_task_ns_pid(leader);
 
         // Up Parent: always a process (might be the same as Parent if parent is a process).
-        save_to_submit_buf(&p.event->args_buf, (void *) &up_parent_tid, sizeof(int), 10);
-        save_to_submit_buf(&p.event->args_buf, (void *) &up_parent_ns_tid, sizeof(int), 11);
-        save_to_submit_buf(&p.event->args_buf, (void *) &up_parent_pid, sizeof(int), 12);
-        save_to_submit_buf(&p.event->args_buf, (void *) &up_parent_ns_pid, sizeof(int), 13);
-        save_to_submit_buf(&p.event->args_buf, (void *) &up_parent_start_time, sizeof(u64), 14);
+        save_to_submit_buf(&p.event->args_buf, (void *) &parent_process_tid, sizeof(int), 10);
+        save_to_submit_buf(&p.event->args_buf, (void *) &parent_process_ns_tid, sizeof(int), 11);
+        save_to_submit_buf(&p.event->args_buf, (void *) &parent_process_pid, sizeof(int), 12);
+        save_to_submit_buf(&p.event->args_buf, (void *) &parent_process_ns_pid, sizeof(int), 13);
+        save_to_submit_buf(
+            &p.event->args_buf, (void *) &parent_process_start_time, sizeof(u64), 14);
         // Leader: always a process (might be the same as the Child if child is a process).
         save_to_submit_buf(&p.event->args_buf, (void *) &leader_tid, sizeof(int), 15);
         save_to_submit_buf(&p.event->args_buf, (void *) &leader_ns_tid, sizeof(int), 16);
@@ -718,7 +719,7 @@ int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 }
 
 // number of iterations - value that the verifier was seen to cope with - the higher, the better
-#define MAX_NUM_MODULES         450
+#define MAX_NUM_MODULES         440
 #define HISTORY_SCAN_FAILURE    0
 #define HISTORY_SCAN_SUCCESSFUL 1
 
@@ -988,7 +989,7 @@ statfunc int find_modules_from_mod_tree(program_data_t *p)
 static __always_inline u64 check_new_mods_only(program_data_t *p)
 {
     struct module *pos, *n;
-    u64 start_scan_time = bpf_ktime_get_ns();
+    u64 start_scan_time = get_current_time_in_ns();
     char modules_sym[8] = "modules";
     kernel_new_mod_t *new_mod;
     u64 mod_addr;
@@ -1008,7 +1009,7 @@ static __always_inline u64 check_new_mods_only(program_data_t *p)
         mod_addr = (u64) pos;
         new_mod = bpf_map_lookup_elem(&new_module_map, &mod_addr);
         if (new_mod) {
-            new_mod->last_seen_time = bpf_ktime_get_ns();
+            new_mod->last_seen_time = get_current_time_in_ns();
         }
     }
 
@@ -1151,7 +1152,7 @@ int uprobe_lkm_seeker(struct pt_regs *ctx)
         return 0;
     }
 
-    start_scan_time_init_shown_mods = bpf_ktime_get_ns();
+    start_scan_time_init_shown_mods = get_current_time_in_ns();
     int ret = init_shown_modules();
     if (ret != 0) {
         tracee_log(ctx, BPF_LOG_LVL_WARN, BPF_LOG_ID_HID_KER_MOD, ret);
@@ -1404,6 +1405,7 @@ int sched_process_exec_event_submit_tail(struct bpf_raw_tracepoint_args *ctx)
     save_to_submit_buf(&p.event->args_buf, &stdin_type, sizeof(unsigned short), 12);
     save_str_to_buf(&p.event->args_buf, stdin_path, 13);
     save_to_submit_buf(&p.event->args_buf, &invoked_from_kernel, sizeof(int), 14);
+    save_str_to_buf(&p.event->args_buf, (void *) p.task_info->context.comm, 15);
     if (p.config->options & OPT_EXEC_ENV) {
         unsigned long env_start, env_end;
         env_start = get_env_start_from_mm(mm);
@@ -1411,7 +1413,7 @@ int sched_process_exec_event_submit_tail(struct bpf_raw_tracepoint_args *ctx)
         int envc = get_envc_from_bprm(bprm);
 
         save_args_str_arr_to_buf(
-            &p.event->args_buf, (void *) env_start, (void *) env_end, envc, 15);
+            &p.event->args_buf, (void *) env_start, (void *) env_end, envc, 16);
     }
 
     events_perf_submit(&p, 0);
@@ -1556,6 +1558,11 @@ int tracepoint__sched__sched_switch(struct bpf_raw_tracepoint_args *ctx)
 SEC("kprobe/filldir64")
 int BPF_KPROBE(trace_filldir64)
 {
+    // only inode=0 is relevant, simple filter prior to program run
+    unsigned long process_inode_number = (unsigned long) PT_REGS_PARM5(ctx);
+    if (process_inode_number != 0)
+        return 0;
+
     program_data_t p = {};
     if (!init_program_data(&p, ctx, HIDDEN_INODES))
         return 0;
@@ -1564,10 +1571,6 @@ int BPF_KPROBE(trace_filldir64)
         return 0;
 
     char *process_name = (char *) PT_REGS_PARM2(ctx);
-    unsigned long process_inode_number = (unsigned long) PT_REGS_PARM5(ctx);
-
-    if (process_inode_number != 0)
-        return 0;
 
     save_str_to_buf(&p.event->args_buf, process_name, 0);
     return events_perf_submit(&p, 0);
@@ -4308,7 +4311,7 @@ int tracepoint__module__module_load(struct bpf_raw_tracepoint_args *ctx)
     struct module *mod = (struct module *) ctx->args[0];
 
     if (event_is_selected(HIDDEN_KERNEL_MODULE_SEEKER, p.event->context.policies_version)) {
-        u64 insert_time = bpf_ktime_get_ns();
+        u64 insert_time = get_current_time_in_ns();
         kernel_new_mod_t new_mod = {.insert_time = insert_time};
         u64 mod_addr = (u64) mod;
         // new_module_map - must be after the module is added to modules list,
@@ -4345,7 +4348,7 @@ int tracepoint__module__module_free(struct bpf_raw_tracepoint_args *ctx)
         // risk of race condition
         bpf_map_delete_elem(&new_module_map, &mod_addr);
 
-        kernel_deleted_mod_t deleted_mod = {.deleted_time = bpf_ktime_get_ns()};
+        kernel_deleted_mod_t deleted_mod = {.deleted_time = get_current_time_in_ns()};
         bpf_map_update_elem(&recent_deleted_module_map, &mod_addr, &deleted_mod, BPF_ANY);
     }
 
@@ -5130,6 +5133,33 @@ int BPF_KPROBE(trace_security_task_setrlimit)
     return events_perf_submit(&p, 0);
 }
 
+SEC("kprobe/security_settime64")
+int BPF_KPROBE(trace_security_settime64)
+{
+    program_data_t p = {};
+    if (!init_program_data(&p, ctx, SECURITY_SETTIME64))
+        return 0;
+
+    if (!evaluate_scope_filters(&p))
+        return 0;
+
+    const struct timespec64 *ts = (const struct timespec64 *) PT_REGS_PARM1(ctx);
+    const struct timezone *tz = (const struct timezone *) PT_REGS_PARM2(ctx);
+
+    u64 tv_sec = BPF_CORE_READ(ts, tv_sec);
+    u64 tv_nsec = BPF_CORE_READ(ts, tv_nsec);
+
+    int tz_minuteswest = BPF_CORE_READ(tz, tz_minuteswest);
+    int tz_dsttime = BPF_CORE_READ(tz, tz_dsttime);
+
+    save_to_submit_buf(&p.event->args_buf, &tv_sec, sizeof(u64), 0);
+    save_to_submit_buf(&p.event->args_buf, &tv_nsec, sizeof(u64), 1);
+    save_to_submit_buf(&p.event->args_buf, &tz_minuteswest, sizeof(int), 2);
+    save_to_submit_buf(&p.event->args_buf, &tz_dsttime, sizeof(int), 3);
+
+    return events_perf_submit(&p, 0);
+}
+
 // clang-format off
 
 // Network Packets (works from ~5.2 and beyond)
@@ -5397,7 +5427,7 @@ statfunc u32 cgroup_skb_submit_flow(struct __sk_buff *ctx,
                                     u32 event_type, u32 size, u32 flow)
 {
     netflowvalue_t *netflowvalptr, netflowvalue = {
-                                       .last_update = bpf_ktime_get_ns(),
+                                       .last_update = get_current_time_in_ns(),
                                        .direction = flow_unknown,
                                    };
 
@@ -6590,7 +6620,7 @@ int sched_process_fork_signal(struct bpf_raw_tracepoint_args *ctx)
     struct task_struct *parent = (struct task_struct *) ctx->args[0];
     struct task_struct *child = (struct task_struct *) ctx->args[1];
     struct task_struct *leader = get_leader_task(child);
-    struct task_struct *up_parent = get_leader_task(get_parent_task(leader));
+    struct task_struct *parent_process = get_leader_task(get_parent_task(leader));
 
     // In the Linux kernel:
     //
@@ -6620,7 +6650,7 @@ int sched_process_fork_signal(struct bpf_raw_tracepoint_args *ctx)
     // userland tgid = kernel pid
 
     // The event timestamp, so process tree info can be changelog'ed.
-    u64 timestamp = bpf_ktime_get_ns();
+    u64 timestamp = get_current_time_in_ns();
     save_to_submit_buf(&signal->args_buf, &timestamp, sizeof(u64), 0);
 
     // Parent information.
@@ -6637,12 +6667,12 @@ int sched_process_fork_signal(struct bpf_raw_tracepoint_args *ctx)
     int child_ns_pid = get_task_ns_tgid(child);
     int child_ns_tid = get_task_ns_pid(child);
 
-    // Up Parent information: Go up in hierarchy until parent is process.
-    u64 up_parent_start_time = get_task_start_time(up_parent);
-    int up_parent_pid = get_task_host_tgid(up_parent);
-    int up_parent_tid = get_task_host_pid(up_parent);
-    int up_parent_ns_pid = get_task_ns_tgid(up_parent);
-    int up_parent_ns_tid = get_task_ns_pid(up_parent);
+    // Parent Process information: Go up in hierarchy until parent is process.
+    u64 parent_process_start_time = get_task_start_time(parent_process);
+    int parent_process_pid = get_task_host_tgid(parent_process);
+    int parent_process_tid = get_task_host_pid(parent_process);
+    int parent_process_ns_pid = get_task_ns_tgid(parent_process);
+    int parent_process_ns_tid = get_task_ns_pid(parent_process);
 
     // Leader information.
     u64 leader_start_time = get_task_start_time(leader);
@@ -6665,12 +6695,12 @@ int sched_process_fork_signal(struct bpf_raw_tracepoint_args *ctx)
     save_to_submit_buf(&signal->args_buf, (void *) &child_ns_pid, sizeof(int), 9);
     save_to_submit_buf(&signal->args_buf, (void *) &child_start_time, sizeof(u64), 10);
 
-    // Up Parent: always a real process (might be the same as Parent if it is a real process).
-    save_to_submit_buf(&signal->args_buf, (void *) &up_parent_tid, sizeof(int), 11);
-    save_to_submit_buf(&signal->args_buf, (void *) &up_parent_ns_tid, sizeof(int), 12);
-    save_to_submit_buf(&signal->args_buf, (void *) &up_parent_pid, sizeof(int), 13);
-    save_to_submit_buf(&signal->args_buf, (void *) &up_parent_ns_pid, sizeof(int), 14);
-    save_to_submit_buf(&signal->args_buf, (void *) &up_parent_start_time, sizeof(u64), 15);
+    // Parent Process: always a real process (might be the same as Parent if it is a real process).
+    save_to_submit_buf(&signal->args_buf, (void *) &parent_process_tid, sizeof(int), 11);
+    save_to_submit_buf(&signal->args_buf, (void *) &parent_process_ns_tid, sizeof(int), 12);
+    save_to_submit_buf(&signal->args_buf, (void *) &parent_process_pid, sizeof(int), 13);
+    save_to_submit_buf(&signal->args_buf, (void *) &parent_process_ns_pid, sizeof(int), 14);
+    save_to_submit_buf(&signal->args_buf, (void *) &parent_process_start_time, sizeof(u64), 15);
 
     // Leader: always a real process (might be the same as the Child if child is a real process).
     save_to_submit_buf(&signal->args_buf, (void *) &leader_tid, sizeof(int), 16);
@@ -6707,7 +6737,7 @@ int sched_process_exec_signal(struct bpf_raw_tracepoint_args *ctx)
     u32 leader_hash = hash_task_id(get_task_host_pid(leader), get_task_start_time(leader));
 
     // The event timestamp, so process tree info can be changelog'ed.
-    u64 timestamp = bpf_ktime_get_ns();
+    u64 timestamp = get_current_time_in_ns();
     save_to_submit_buf(&signal->args_buf, &timestamp, sizeof(u64), 0);
 
     save_to_submit_buf(&signal->args_buf, (void *) &task_hash, sizeof(u32), 1);
@@ -6802,7 +6832,7 @@ int sched_process_exit_signal(struct bpf_raw_tracepoint_args *ctx)
     u32 leader_hash = hash_task_id(get_task_host_pid(leader), get_task_start_time(leader));
 
     // The event timestamp, so process tree info can be changelog'ed.
-    u64 timestamp = bpf_ktime_get_ns();
+    u64 timestamp = get_current_time_in_ns();
     save_to_submit_buf(&signal->args_buf, &timestamp, sizeof(u64), 0);
 
     save_to_submit_buf(&signal->args_buf, (void *) &task_hash, sizeof(u32), 1);

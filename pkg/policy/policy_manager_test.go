@@ -1,4 +1,4 @@
-package ebpf
+package policy
 
 import (
 	"sync"
@@ -7,13 +7,12 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/aquasecurity/tracee/pkg/events"
-	"github.com/aquasecurity/tracee/pkg/policy"
 )
 
 func TestPolicyManagerEnableRule(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	policy1Mached := uint64(0b10)
 	policy2Mached := uint64(0b100)
@@ -23,39 +22,49 @@ func TestPolicyManagerEnableRule(t *testing.T) {
 	assert.False(t, policyManager.IsRuleEnabled(policy2Mached, events.SecurityBPF))
 	assert.False(t, policyManager.IsRuleEnabled(policy1And2Mached, events.SecurityBPF))
 
-	policyManager.EnableRule(1, events.SecurityBPF)
+	err := policyManager.EnableRule(1, events.SecurityBPF)
+	assert.NoError(t, err)
 
 	assert.True(t, policyManager.IsRuleEnabled(policy1Mached, events.SecurityBPF))
 	assert.False(t, policyManager.IsRuleEnabled(policy2Mached, events.SecurityBPF))
 	assert.True(t, policyManager.IsRuleEnabled(policy1And2Mached, events.SecurityBPF))
 
-	policyManager.EnableRule(2, events.SecurityBPF)
+	err = policyManager.EnableRule(2, events.SecurityBPF)
+	assert.NoError(t, err)
 
 	assert.True(t, policyManager.IsRuleEnabled(policy1Mached, events.SecurityBPF))
 	assert.True(t, policyManager.IsRuleEnabled(policy2Mached, events.SecurityBPF))
 	assert.True(t, policyManager.IsRuleEnabled(policy1And2Mached, events.SecurityBPF))
+
+	err = policyManager.EnableRule(-1, events.SecurityBPF)
+	assert.Error(t, err)
 }
 
 func TestPolicyManagerDisableRule(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	policy1Mached := uint64(0b10)
 	policy2Mached := uint64(0b100)
 	policy1And2Mached := uint64(0b110)
 
-	policyManager.EnableRule(1, events.SecurityBPF)
+	err := policyManager.EnableRule(1, events.SecurityBPF)
+	assert.NoError(t, err)
 
 	assert.True(t, policyManager.IsRuleEnabled(policy1Mached, events.SecurityBPF))
 	assert.False(t, policyManager.IsRuleEnabled(policy2Mached, events.SecurityBPF))
 	assert.True(t, policyManager.IsRuleEnabled(policy1And2Mached, events.SecurityBPF))
 
-	policyManager.DisableRule(1, events.SecurityBPF)
+	err = policyManager.DisableRule(1, events.SecurityBPF)
+	assert.NoError(t, err)
 
 	assert.False(t, policyManager.IsRuleEnabled(policy1Mached, events.SecurityBPF))
 	assert.False(t, policyManager.IsRuleEnabled(policy2Mached, events.SecurityBPF))
 	assert.False(t, policyManager.IsRuleEnabled(policy1And2Mached, events.SecurityBPF))
+
+	err = policyManager.DisableRule(-1, events.SecurityBPF)
+	assert.Error(t, err)
 }
 
 func TestPolicyManagerEnableAndDisableRuleConcurrent(t *testing.T) {
@@ -77,13 +86,13 @@ func TestPolicyManagerEnableAndDisableRuleConcurrent(t *testing.T) {
 		events.FileModification,
 	}
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
-		for i := 0; i < policy.PolicyMax; i++ {
+		for i := 0; i < PolicyMax; i++ {
 			for _, e := range eventsToEnable {
 				policyManager.EnableRule(i, e)
 			}
@@ -93,7 +102,7 @@ func TestPolicyManagerEnableAndDisableRuleConcurrent(t *testing.T) {
 
 	wg.Add(1)
 	go func() {
-		for i := 0; i < policy.PolicyMax; i++ {
+		for i := 0; i < PolicyMax; i++ {
 			for _, e := range eventsToDisable {
 				policyManager.DisableRule(i, e)
 			}
@@ -103,12 +112,12 @@ func TestPolicyManagerEnableAndDisableRuleConcurrent(t *testing.T) {
 
 	wg.Wait()
 
-	for i := 0; i < policy.PolicyMax; i++ {
+	for i := 0; i < PolicyMax; i++ {
 		for _, e := range eventsToEnable {
-			assert.True(t, policyManager.IsRuleEnabled(policy.PolicyAll, e))
+			assert.True(t, policyManager.IsRuleEnabled(PolicyAll, e))
 		}
 		for _, e := range eventsToDisable {
-			assert.False(t, policyManager.IsRuleEnabled(policy.PolicyAll, e))
+			assert.False(t, policyManager.IsRuleEnabled(PolicyAll, e))
 		}
 	}
 }
@@ -116,7 +125,7 @@ func TestPolicyManagerEnableAndDisableRuleConcurrent(t *testing.T) {
 func TestPolicyManagerEnableEvent(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	assert.False(t, policyManager.isEventEnabled(events.SecurityBPF))
 	assert.False(t, policyManager.isEventEnabled(events.SecurityFileOpen))
@@ -134,7 +143,7 @@ func TestPolicyManagerEnableEvent(t *testing.T) {
 func TestPolicyManagerDisableEvent(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	policyManager.EnableEvent(events.SecurityBPF)
 	policyManager.EnableEvent(events.SecurityFileOpen)
@@ -171,7 +180,7 @@ func TestPolicyManagerEnableAndDisableEventConcurrent(t *testing.T) {
 		events.FileModification,
 	}
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	// activate events
 	for _, e := range eventsToDisable {
@@ -182,7 +191,7 @@ func TestPolicyManagerEnableAndDisableEventConcurrent(t *testing.T) {
 
 	wg.Add(1)
 	go func() {
-		for i := 0; i < policy.PolicyMax; i++ {
+		for i := 0; i < PolicyMax; i++ {
 			for _, e := range eventsToEnable {
 				policyManager.EnableEvent(e)
 			}
@@ -192,7 +201,7 @@ func TestPolicyManagerEnableAndDisableEventConcurrent(t *testing.T) {
 
 	wg.Add(1)
 	go func() {
-		for i := 0; i < policy.PolicyMax; i++ {
+		for i := 0; i < PolicyMax; i++ {
 			for _, e := range eventsToDisable {
 				policyManager.DisableEvent(e)
 			}
@@ -202,7 +211,7 @@ func TestPolicyManagerEnableAndDisableEventConcurrent(t *testing.T) {
 
 	wg.Wait()
 
-	for i := 0; i < policy.PolicyMax; i++ {
+	for i := 0; i < PolicyMax; i++ {
 		for _, e := range eventsToEnable {
 			assert.True(t, policyManager.IsEventEnabled(e))
 		}
@@ -215,7 +224,7 @@ func TestPolicyManagerEnableAndDisableEventConcurrent(t *testing.T) {
 func TestEnableRuleAlsoEnableEvent(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	assert.False(t, policyManager.IsEventEnabled(events.SecurityBPF))
 
@@ -227,7 +236,7 @@ func TestEnableRuleAlsoEnableEvent(t *testing.T) {
 func TestDisableRuleAlsoEnableEvent(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	assert.False(t, policyManager.IsEventEnabled(events.SecurityFileOpen))
 
@@ -239,7 +248,7 @@ func TestDisableRuleAlsoEnableEvent(t *testing.T) {
 func TestPolicyManagerIsEnabled(t *testing.T) {
 	t.Parallel()
 
-	policyManager := newPolicyManager()
+	policyManager := NewPolicyManager(nil)
 
 	policy1Mached := uint64(0b10)
 	policy2Mached := uint64(0b100)

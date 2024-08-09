@@ -3,12 +3,14 @@ package ebpf
 import (
 	gocontext "context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"kernel.org/pub/linux/libs/security/libcap/cap"
@@ -40,6 +42,7 @@ import (
 	"github.com/aquasecurity/tracee/pkg/proctree"
 	"github.com/aquasecurity/tracee/pkg/signatures/engine"
 	"github.com/aquasecurity/tracee/pkg/streams"
+	traceetime "github.com/aquasecurity/tracee/pkg/time"
 	"github.com/aquasecurity/tracee/pkg/utils"
 	"github.com/aquasecurity/tracee/pkg/utils/environment"
 	"github.com/aquasecurity/tracee/pkg/utils/proc"
@@ -118,14 +121,15 @@ type Tracee struct {
 	// Streams
 	streamsManager *streams.StreamsManager
 	// policyManager manages policy state
-	policyManager *policyManager
+	policyManager *policy.PolicyManager
 	// The dependencies of events used by Tracee
 	eventsDependencies *dependencies.Manager
-
 	// Ksymbols needed to be kept alive in table.
 	// This does not mean they are required for tracee to function.
 	// TODO: remove this in favor of dependency manager nodes
 	requiredKsyms []string
+	// Time for normalization
+	timeNormalizer traceetime.TimeNormalizer
 }
 
 func (t *Tracee) Stats() *metrics.Stats {
@@ -225,8 +229,6 @@ func New(cfg config.Config) (*Tracee, error) {
 		return nil, errfmt.Errorf("validation error: %v", err)
 	}
 
-	policyManager := newPolicyManager()
-
 	// Create Tracee
 
 	t := &Tracee{
@@ -238,13 +240,15 @@ func New(cfg config.Config) (*Tracee, error) {
 		eventsState:     make(map[events.ID]events.EventState),
 		eventSignatures: make(map[events.ID]bool),
 		streamsManager:  streams.NewStreamsManager(),
-		policyManager:   policyManager,
+		policyManager:   policy.NewPolicyManager(cfg.InitialPolicies...),
 		eventsDependencies: dependencies.NewDependenciesManager(
 			func(id events.ID) events.Dependencies {
 				return events.Core.GetDefinitionByID(id).GetDependencies()
 			}),
 		requiredKsyms: []string{},
 	}
+
+	t.config.InitialPolicies = []*policy.Policy{} // clear initial policies to avoid wrong references
 
 	// TODO: As dynamic event addition or removal becomes a thing, we should subscribe all the watchers
 	// before selecting them. There is no reason to select the event in the New function anyhow.
@@ -273,7 +277,16 @@ func New(cfg config.Config) (*Tracee, error) {
 
 	// Initialize capabilities rings soon
 
-	err = capabilities.Initialize(t.config.Capabilities.BypassCaps)
+	useBaseEbpf := func(cfg config.Config) bool {
+		return cfg.Output.StackAddresses
+	}
+
+	err = capabilities.Initialize(
+		capabilities.Config{
+			Bypass:   t.config.Capabilities.BypassCaps,
+			BaseEbpf: useBaseEbpf(t.config),
+		},
+	)
 	if err != nil {
 		return t, errfmt.WrapError(err)
 	}
@@ -329,7 +342,7 @@ func New(cfg config.Config) (*Tracee, error) {
 
 	// TODO: extract this to a function to be called from here and from
 	// policies changes.
-	for it := t.config.Policies.CreateAllIterator(); it.HasNext(); {
+	for it := t.policyManager.CreateAllIterator(); it.HasNext(); {
 		p := it.Next()
 		for e := range p.EventsToTrace {
 			var submit, emit uint64
@@ -341,7 +354,10 @@ func New(cfg config.Config) (*Tracee, error) {
 			utils.SetBit(&emit, uint(p.ID))
 			t.selectEvent(e, events.EventState{Submit: submit, Emit: emit})
 
-			policyManager.EnableRule(p.ID, e)
+			err := t.policyManager.EnableRule(p.ID, e)
+			if err != nil {
+				logger.Errorw("Failed to enable rule", "policy", p.ID, "event", e, "error", err)
+			}
 		}
 	}
 
@@ -430,15 +446,6 @@ func (t *Tracee) Init(ctx gocontext.Context) error {
 		}
 	} else {
 		logger.Debugw("Initializing buckets cache", "error", errfmt.WrapError(err))
-	}
-
-	// Initialize Process Tree (if enabled)
-
-	if t.config.ProcTree.Source != proctree.SourceNone {
-		t.processTree, err = proctree.NewProcessTree(ctx, t.config.ProcTree)
-		if err != nil {
-			return errfmt.WrapError(err)
-		}
 	}
 
 	// Initialize cgroups filesystems
@@ -531,6 +538,53 @@ func (t *Tracee) Init(ctx gocontext.Context) error {
 		}
 	}
 
+	// Initialize time normalizer
+
+	// Checking the kernel symbol needs to happen after obtaining the capability;
+	// otherwise, we get a warning.
+	usedClockID := traceetime.CLOCK_BOOTTIME
+	err = capabilities.GetInstance().EBPF(
+		func() error {
+			supported, innerErr := bpf.BPFHelperIsSupported(bpf.BPFProgTypeKprobe, bpf.BPFFuncKtimeGetBootNs)
+
+			// only report if operation not permitted
+			if errors.Is(innerErr, syscall.EPERM) {
+				return innerErr
+			}
+
+			// If BPFFuncKtimeGetBootNs is not available, eBPF will generate events based on monotonic time.
+			if !supported {
+				usedClockID = traceetime.CLOCK_MONOTONIC
+			}
+			return nil
+		})
+	if err != nil {
+		return errfmt.WrapError(err)
+	}
+
+	// elapsed time in nanoseconds since system start
+	t.startTime = uint64(traceetime.GetStartTimeNS(int32(usedClockID)))
+	// time in nanoseconds when the system was booted
+	t.bootTime = uint64(traceetime.GetBootTimeNS(int32(usedClockID)))
+
+	t.timeNormalizer = traceetime.CreateTimeNormalizerByConfig(t.config.Output.RelativeTime, t.startTime, t.bootTime)
+
+	// Initialize Process Tree (if enabled)
+
+	if t.config.ProcTree.Source != proctree.SourceNone {
+		// As procfs use boot time to calculate process start time, we can use the procfs
+		// only if the times we get from the eBPF programs are based on the boot time (instead of monotonic).
+		proctreeConfig := t.config.ProcTree
+		if usedClockID == traceetime.CLOCK_MONOTONIC {
+			proctreeConfig.ProcfsInitialization = false
+			proctreeConfig.ProcfsQuerying = false
+		}
+		t.processTree, err = proctree.NewProcessTree(ctx, proctreeConfig, t.timeNormalizer)
+		if err != nil {
+			return errfmt.WrapError(err)
+		}
+	}
+
 	// Initialize eBPF programs and maps
 
 	err = capabilities.GetInstance().EBPF(
@@ -607,11 +661,6 @@ func (t *Tracee) Init(ctx gocontext.Context) error {
 		},
 	}
 
-	// Initialize times
-
-	t.startTime = uint64(utils.GetStartTimeNS())
-	t.bootTime = uint64(utils.GetBootTimeNS())
-
 	return nil
 }
 
@@ -637,27 +686,11 @@ func (t *Tracee) initTailCall(tailCall events.TailCall) error {
 		return errfmt.Errorf("could not get BPF program FD for %s: %v", tailCallProgName, err)
 	}
 
-	once := &sync.Once{}
-
 	// Pick all indexes (event, or syscall, IDs) the BPF program should be related to.
 	for _, index := range tailCallIndexes {
-		// Special treatment for indexes of syscall events.
-		if events.Core.GetDefinitionByID(events.ID(index)).IsSyscall() {
-			// Optimization: enable enter/exit probes only if at least one syscall is enabled.
-			once.Do(func() {
-				err := t.probes.Attach(probes.SyscallEnter__Internal, t.kernelSymbols)
-				if err != nil {
-					logger.Errorw("error attaching to syscall enter", "error", err)
-				}
-				err = t.probes.Attach(probes.SyscallExit__Internal, t.kernelSymbols)
-				if err != nil {
-					logger.Errorw("error attaching to syscall enter", "error", err)
-				}
-			})
-			// Workaround: Do not map eBPF program to unsupported syscalls (arm64, e.g.)
-			if index >= uint32(events.Unsupported) {
-				continue
-			}
+		// Workaround: Do not map eBPF program to unsupported syscalls (arm64, e.g.)
+		if index >= uint32(events.Unsupported) {
+			continue
 		}
 		// Update given eBPF map with the eBPF program file descriptor at given index.
 		err := bpfMap.Update(unsafe.Pointer(&index), unsafe.Pointer(&bpfProgFD))
@@ -676,7 +709,7 @@ func (t *Tracee) initDerivationTable() error {
 	shouldSubmit := func(id events.ID) func() bool {
 		return func() bool { return t.eventsState[id].Submit > 0 }
 	}
-	symbolsCollisions := derive.SymbolsCollision(t.contSymbolsLoader, t.config.Policies)
+	symbolsCollisions := derive.SymbolsCollision(t.contSymbolsLoader, t.policyManager)
 
 	executeFailedGen, err := derive.InitProcessExecuteFailedGenerator()
 	if err != nil {
@@ -720,7 +753,7 @@ func (t *Tracee) initDerivationTable() error {
 				Enabled: shouldSubmit(events.SymbolsLoaded),
 				DeriveFunction: derive.SymbolsLoaded(
 					t.contSymbolsLoader,
-					t.config.Policies,
+					t.policyManager,
 				),
 			},
 			events.SymbolsCollision: {
@@ -896,12 +929,12 @@ func (t *Tracee) getOptionsConfig() uint32 {
 
 // newConfig returns a new Config instance based on the current Tracee state and
 // the given policies config and version.
-func (t *Tracee) newConfig(cfg *policy.PoliciesConfig, version uint16) *Config {
+func (t *Tracee) newConfig(cfg *policy.PoliciesConfig) *Config {
 	return &Config{
 		TraceePid:       uint32(os.Getpid()),
 		Options:         t.getOptionsConfig(),
 		CgroupV1Hid:     uint32(t.cgroups.GetDefaultCgroupHierarchyID()),
-		PoliciesVersion: version,
+		PoliciesVersion: 1, // version will be removed soon
 		PoliciesConfig:  *cfg,
 	}
 }
@@ -964,7 +997,7 @@ func (t *Tracee) initKsymTableRequiredSyms() error {
 		}
 	}
 	if _, ok := t.eventsState[events.PrintMemDump]; ok {
-		for it := t.config.Policies.CreateAllIterator(); it.HasNext(); {
+		for it := t.policyManager.CreateAllIterator(); it.HasNext(); {
 			p := it.Next()
 			// This might break in the future if PrintMemDump will become a dependency of another event.
 			_, isChosen := p.EventsToTrace[events.PrintMemDump]
@@ -1144,7 +1177,7 @@ func (t *Tracee) populateBPFMaps() error {
 	}
 
 	// Initialize config and filter maps
-	err = t.populateFilterMaps(t.config.Policies, false)
+	err = t.populateFilterMaps(false)
 	if err != nil {
 		return errfmt.WrapError(err)
 	}
@@ -1216,8 +1249,8 @@ func (t *Tracee) populateBPFMaps() error {
 }
 
 // populateFilterMaps populates the eBPF maps with the given policies
-func (t *Tracee) populateFilterMaps(newPolicies *policy.Policies, updateProcTree bool) error {
-	polCfg, err := newPolicies.UpdateBPF(
+func (t *Tracee) populateFilterMaps(updateProcTree bool) error {
+	polCfg, err := t.policyManager.UpdateBPF(
 		t.bpfModule,
 		t.containers,
 		t.eventsState,
@@ -1231,7 +1264,7 @@ func (t *Tracee) populateFilterMaps(newPolicies *policy.Policies, updateProcTree
 
 	// Create new config with updated policies and update eBPF map
 
-	cfg := t.newConfig(polCfg, newPolicies.Version())
+	cfg := t.newConfig(polCfg)
 	if err := cfg.UpdateBPF(t.bpfModule); err != nil {
 		return errfmt.WrapError(err)
 	}
@@ -1359,6 +1392,10 @@ func (t *Tracee) initBPF() error {
 		return errfmt.WrapError(err)
 	}
 
+	// Need to force nil to allow the garbage
+	// collector to free the BPF object
+	t.config.BPFObjBytes = nil
+
 	// Populate eBPF maps with initial data
 
 	err = t.populateBPFMaps()
@@ -1373,13 +1410,14 @@ func (t *Tracee) initBPF() error {
 		t.containers,
 		t.config.NoContainersEnrich,
 		t.processTree,
+		t.timeNormalizer,
 	)
 	if err != nil {
 		return errfmt.WrapError(err)
 	}
 
 	// returned PoliciesConfig is not used here, therefore it's discarded
-	_, err = t.config.Policies.UpdateBPF(t.bpfModule, t.containers, t.eventsState, t.eventsParamTypes, false, true)
+	_, err = t.policyManager.UpdateBPF(t.bpfModule, t.containers, t.eventsState, t.eventsParamTypes, false, true)
 	if err != nil {
 		return errfmt.WrapError(err)
 	}
@@ -1712,11 +1750,11 @@ func (t *Tracee) getSelfLoadedPrograms(kprobesOnly bool) map[string]int {
 func (t *Tracee) invokeInitEvents(out chan *trace.Event) {
 	var matchedPolicies uint64
 
-	setMatchedPolicies := func(event *trace.Event, matchedPolicies uint64, pols *policy.Policies) {
-		event.PoliciesVersion = pols.Version()
+	setMatchedPolicies := func(event *trace.Event, matchedPolicies uint64, pManager *policy.PolicyManager) {
+		event.PoliciesVersion = 1 // version will be removed soon
 		event.MatchedPoliciesKernel = matchedPolicies
 		event.MatchedPoliciesUser = matchedPolicies
-		event.MatchedPolicies = pols.MatchedNames(matchedPolicies)
+		event.MatchedPolicies = pManager.MatchedNames(matchedPolicies)
 	}
 
 	policiesMatch := func(state events.EventState) uint64 {
@@ -1725,10 +1763,18 @@ func (t *Tracee) invokeInitEvents(out chan *trace.Event) {
 
 	// Initial namespace events
 
+	matchedPolicies = policiesMatch(t.eventsState[events.TraceeInfo])
+	if matchedPolicies > 0 {
+		traceeDataEvent := events.TraceeInfoEvent(t.bootTime, t.startTime)
+		setMatchedPolicies(&traceeDataEvent, matchedPolicies, t.policyManager)
+		out <- &traceeDataEvent
+		_ = t.stats.EventCount.Increment()
+	}
+
 	matchedPolicies = policiesMatch(t.eventsState[events.InitNamespaces])
 	if matchedPolicies > 0 {
 		systemInfoEvent := events.InitNamespacesEvent()
-		setMatchedPolicies(&systemInfoEvent, matchedPolicies, t.config.Policies)
+		setMatchedPolicies(&systemInfoEvent, matchedPolicies, t.policyManager)
 		out <- &systemInfoEvent
 		_ = t.stats.EventCount.Increment()
 	}
@@ -1740,7 +1786,7 @@ func (t *Tracee) invokeInitEvents(out chan *trace.Event) {
 		existingContainerEvents := events.ExistingContainersEvents(t.containers, t.config.NoContainersEnrich)
 		for i := range existingContainerEvents {
 			event := &(existingContainerEvents[i])
-			setMatchedPolicies(event, matchedPolicies, t.config.Policies)
+			setMatchedPolicies(event, matchedPolicies, t.policyManager)
 			out <- event
 			_ = t.stats.EventCount.Increment()
 		}
@@ -1751,7 +1797,7 @@ func (t *Tracee) invokeInitEvents(out chan *trace.Event) {
 	matchedPolicies = policiesMatch(t.eventsState[events.FtraceHook])
 	if matchedPolicies > 0 {
 		ftraceBaseEvent := events.GetFtraceBaseEvent()
-		setMatchedPolicies(ftraceBaseEvent, matchedPolicies, t.config.Policies)
+		setMatchedPolicies(ftraceBaseEvent, matchedPolicies, t.policyManager)
 		logger.Debugw("started ftraceHook goroutine")
 
 		// TODO: Ideally, this should be inside the goroutine and be computed before each run,
@@ -1820,18 +1866,7 @@ func (t *Tracee) triggerMemDump(event trace.Event) []error {
 
 	var errs []error
 
-	// We want to use the policies of relevant to the triggering event
-	policies, err := policy.Snapshots().Get(event.PoliciesVersion)
-	if err != nil {
-		logger.Debugw("Error getting policies for print_mem_dump event", "error", err)
-		// For fallback, try to use latest policies
-		policies, err = policy.Snapshots().GetLast()
-		if err != nil {
-			return []error{err}
-		}
-	}
-
-	for it := policies.CreateAllIterator(); it.HasNext(); {
+	for it := t.policyManager.CreateAllIterator(); it.HasNext(); {
 		p := it.Next()
 		// This might break in the future if PrintMemDump will become a dependency of another event.
 		_, isChosen := p.EventsToTrace[events.PrintMemDump]
@@ -1969,7 +2004,7 @@ func (t *Tracee) Subscribe(policyNames []string) (*streams.Stream, error) {
 	var policyMask uint64
 
 	for _, policyName := range policyNames {
-		p, err := t.config.Policies.LookupByName(policyName)
+		p, err := t.policyManager.LookupByName(policyName)
 		if err != nil {
 			return nil, err
 		}
@@ -1982,7 +2017,7 @@ func (t *Tracee) Subscribe(policyNames []string) (*streams.Stream, error) {
 func (t *Tracee) subscribe(policyMask uint64) *streams.Stream {
 	// TODO: the channel size matches the pipeline channel size,
 	// but we should make it configurable in the future.
-	return t.streamsManager.Subscribe(policyMask, 10000)
+	return t.streamsManager.Subscribe(policyMask, t.config.PipelineChannelSize)
 }
 
 // Unsubscribe unsubscribes stream
@@ -2020,12 +2055,15 @@ func (t *Tracee) EnableRule(policyNames []string, ruleId string) error {
 	}
 
 	for _, policyName := range policyNames {
-		p, err := t.config.Policies.LookupByName(policyName)
+		p, err := t.policyManager.LookupByName(policyName)
 		if err != nil {
 			return err
 		}
 
-		t.policyManager.EnableRule(p.ID, eventID)
+		err = t.policyManager.EnableRule(p.ID, eventID)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -2039,12 +2077,15 @@ func (t *Tracee) DisableRule(policyNames []string, ruleId string) error {
 	}
 
 	for _, policyName := range policyNames {
-		p, err := t.config.Policies.LookupByName(policyName)
+		p, err := t.policyManager.LookupByName(policyName)
 		if err != nil {
 			return err
 		}
 
-		t.policyManager.DisableRule(p.ID, eventID)
+		err = t.policyManager.DisableRule(p.ID, eventID)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

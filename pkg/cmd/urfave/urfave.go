@@ -11,7 +11,6 @@ import (
 	"github.com/aquasecurity/tracee/pkg/config"
 	"github.com/aquasecurity/tracee/pkg/errfmt"
 	"github.com/aquasecurity/tracee/pkg/logger"
-	"github.com/aquasecurity/tracee/pkg/policy"
 	"github.com/aquasecurity/tracee/pkg/utils/environment"
 )
 
@@ -20,9 +19,10 @@ func GetTraceeRunner(c *cli.Context, version string) (cmd.Runner, error) {
 
 	// Initialize a tracee config structure
 	cfg := config.Config{
-		PerfBufferSize:     c.Int("perf-buffer-size"),
-		BlobPerfBufferSize: c.Int("blob-perf-buffer-size"),
-		NoContainersEnrich: c.Bool("no-containers"),
+		PerfBufferSize:      c.Int("perf-buffer-size"),
+		BlobPerfBufferSize:  c.Int("blob-perf-buffer-size"),
+		PipelineChannelSize: c.Int("pipeline-channel-size"),
+		NoContainersEnrich:  c.Bool("no-containers"),
 	}
 
 	// Output command line flags
@@ -125,12 +125,21 @@ func GetTraceeRunner(c *cli.Context, version string) (cmd.Runner, error) {
 	if err != nil {
 		return runner, err
 	}
-	cfg.Policies = policies
-	policy.Snapshots().Store(cfg.Policies)
+	cfg.InitialPolicies = policies
+
+	containerFilterEnabled := func() bool {
+		for _, p := range cfg.InitialPolicies {
+			if p.ContainerFilterEnabled() {
+				return true
+			}
+		}
+
+		return false
+	}
 
 	broadcast, err := printer.NewBroadcast(
 		output.PrinterConfigs,
-		cmd.GetContainerMode(policies.ContainerFilterEnabled(), cfg.NoContainersEnrich),
+		cmd.GetContainerMode(containerFilterEnabled(), cfg.NoContainersEnrich),
 	)
 	if err != nil {
 		return runner, err

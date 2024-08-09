@@ -3,6 +3,7 @@ package dependencies
 import (
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/aquasecurity/tracee/pkg/ebpf/probes"
 	"github.com/aquasecurity/tracee/pkg/events"
@@ -22,8 +23,8 @@ const (
 // As events can depend on multiple things (e.g events, probes), it manages their connections in the form of a tree.
 // The tree supports watcher functions for adding and removing nodes.
 // The watchers should be used as the way to handle changes in events, probes or any other node type in Tracee.
-// The manager is *not* thread-safe.
 type Manager struct {
+	mu                 sync.RWMutex
 	events             map[events.ID]*EventNode
 	probes             map[probes.Handle]*ProbeNode
 	onAdd              map[NodeType][]func(node interface{}) []Action
@@ -33,6 +34,7 @@ type Manager struct {
 
 func NewDependenciesManager(dependenciesGetter func(events.ID) events.Dependencies) *Manager {
 	return &Manager{
+		mu:                 sync.RWMutex{},
 		events:             make(map[events.ID]*EventNode),
 		probes:             make(map[probes.Handle]*ProbeNode),
 		onAdd:              make(map[NodeType][]func(node interface{}) []Action),
@@ -44,17 +46,26 @@ func NewDependenciesManager(dependenciesGetter func(events.ID) events.Dependenci
 // SubscribeAdd adds a watcher function called upon the addition of an event to the tree.
 // Add watcher are called in the order of their subscription.
 func (m *Manager) SubscribeAdd(subscribeType NodeType, onAdd func(node interface{}) []Action) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.onAdd[subscribeType] = append(m.onAdd[subscribeType], onAdd)
 }
 
 // SubscribeRemove adds a watcher function called upon the removal of an event from the tree.
 // Remove watchers are called in reverse order of their subscription.
 func (m *Manager) SubscribeRemove(subscribeType NodeType, onRemove func(node interface{}) []Action) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.onRemove[subscribeType] = append([]func(node interface{}) []Action{onRemove}, m.onRemove[subscribeType]...)
 }
 
 // GetEvent returns the dependencies of the given event.
 func (m *Manager) GetEvent(id events.ID) (*EventNode, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	node := m.getEventNode(id)
 	if node == nil {
 		return nil, ErrNodeNotFound
@@ -64,6 +75,9 @@ func (m *Manager) GetEvent(id events.ID) (*EventNode, error) {
 
 // GetProbe returns the given probe node managed by the Manager
 func (m *Manager) GetProbe(handle probes.Handle) (*ProbeNode, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	probeNode := m.getProbe(handle)
 	if probeNode == nil {
 		return nil, ErrNodeNotFound
@@ -76,6 +90,9 @@ func (m *Manager) GetProbe(handle probes.Handle) (*ProbeNode, error) {
 // It also recursively adds all events that this event depends on (its dependencies) to the tree.
 // This function has no effect if the event is already added.
 func (m *Manager) SelectEvent(id events.ID) (*EventNode, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	return m.buildEvent(id, nil)
 }
 
@@ -84,6 +101,9 @@ func (m *Manager) SelectEvent(id events.ID) (*EventNode, error) {
 // from the tree, and its dependencies will be cleaned if they are not referenced or explicitly selected.
 // Returns whether it was removed.
 func (m *Manager) UnselectEvent(id events.ID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	node := m.getEventNode(id)
 	if node == nil {
 		return false
@@ -101,13 +121,22 @@ func (m *Manager) UnselectEvent(id events.ID) bool {
 // no longer valid).
 // It returns if managed to remove the event, as it might not be present in the tree.
 func (m *Manager) RemoveEvent(id events.ID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.removeEvent(id)
+}
+
+func (m *Manager) removeEvent(id events.ID) error {
 	node := m.getEventNode(id)
 	if node == nil {
 		return ErrNodeNotFound
 	}
+
 	m.removeEventNodeFromDependencies(node)
 	m.removeNode(node)
 	m.removeEventDependents(node)
+
 	return nil
 }
 
@@ -341,7 +370,7 @@ func (m *Manager) removeEventNodeFromDependencies(eventNode *EventNode) {
 // removeEventDependents removes all dependent events from the tree
 func (m *Manager) removeEventDependents(eventNode *EventNode) {
 	for _, dependentEvent := range eventNode.GetDependents() {
-		err := m.RemoveEvent(dependentEvent)
+		err := m.removeEvent(dependentEvent)
 		if err != nil {
 			eventName := events.Core.GetDefinitionByID(dependentEvent).GetName()
 			logger.Debugw("failed to remove dependent event", "event", eventName, "error", err)

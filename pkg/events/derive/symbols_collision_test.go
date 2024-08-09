@@ -492,13 +492,10 @@ func TestSymbolsCollision(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			ps := policy.NewPolicies()
-			policy.Snapshots().Store(ps)
-			err := ps.Set(p)
-			require.NoError(t, err)
+			pManager := policy.NewPolicyManager(p)
 
 			// Pick derive function from mocked tests
-			deriveFunc := SymbolsCollision(mockLoader, ps)
+			deriveFunc := SymbolsCollision(mockLoader, pManager)
 
 			mockLoader.addSOSymbols(
 				testSOInstance{

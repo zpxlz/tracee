@@ -9,10 +9,10 @@ import (
 	"unsafe"
 
 	"github.com/aquasecurity/tracee/pkg/bufferdecoder"
+	"github.com/aquasecurity/tracee/pkg/capabilities"
 	"github.com/aquasecurity/tracee/pkg/errfmt"
 	"github.com/aquasecurity/tracee/pkg/events"
 	"github.com/aquasecurity/tracee/pkg/logger"
-	"github.com/aquasecurity/tracee/pkg/policy"
 	"github.com/aquasecurity/tracee/pkg/utils"
 	"github.com/aquasecurity/tracee/types/trace"
 )
@@ -47,7 +47,7 @@ func (t *Tracee) handleEvents(ctx context.Context, initialized chan<- struct{}) 
 	// Sort stage: events go through a sorting function.
 
 	if t.config.Output.EventsSorting {
-		eventsChan, errc = t.eventsSorter.StartPipeline(ctx, eventsChan)
+		eventsChan, errc = t.eventsSorter.StartPipeline(ctx, eventsChan, t.config.BlobPerfBufferSize)
 		errcList = append(errcList, errc)
 	}
 
@@ -112,7 +112,7 @@ func (t *Tracee) handleEvents(ctx context.Context, initialized chan<- struct{}) 
 // caching function that will enqueue the event into a queue. The queue is then de-queued
 // by a different goroutine that will send the event down the pipeline.
 func (t *Tracee) queueEvents(ctx context.Context, in <-chan *trace.Event) (chan *trace.Event, chan error) {
-	out := make(chan *trace.Event, 10000)
+	out := make(chan *trace.Event, t.config.PipelineChannelSize)
 	errc := make(chan error, 1)
 	done := make(chan struct{}, 1)
 
@@ -156,7 +156,7 @@ func (t *Tracee) queueEvents(ctx context.Context, in <-chan *trace.Event) (chan 
 // through a decoding function that will decode the event from its raw format into a
 // trace.Event type.
 func (t *Tracee) decodeEvents(ctx context.Context, sourceChan chan []byte) (<-chan *trace.Event, <-chan error) {
-	out := make(chan *trace.Event, 10000)
+	out := make(chan *trace.Event, t.config.PipelineChannelSize)
 	errc := make(chan error, 1)
 	sysCompatTranslation := events.Core.IDs32ToIDs()
 	go func() {
@@ -296,20 +296,14 @@ func (t *Tracee) matchPolicies(event *trace.Event) uint64 {
 	eventID := events.ID(event.EventID)
 	bitmap := event.MatchedPoliciesKernel
 
-	policies, err := policy.Snapshots().Get(event.PoliciesVersion)
-	if err != nil {
-		t.handleError(err)
-		return 0
-	}
-
 	// Short circuit if there are no policies in userland that need filtering.
-	if bitmap&policies.FilterableInUserland() == 0 {
+	if !t.policyManager.FilterableInUserland(bitmap) {
 		event.MatchedPoliciesUser = bitmap // store untouched bitmap to be used in sink stage
 		return bitmap
 	}
 
 	// range through each userland filterable policy
-	for it := policies.CreateUserlandIterator(); it.HasNext(); {
+	for it := t.policyManager.CreateUserlandIterator(); it.HasNext(); {
 		p := it.Next()
 		// Policy ID is the bit offset in the bitmap.
 		bitOffset := uint(p.ID)
@@ -440,7 +434,7 @@ func parseSyscallID(syscallID int, isCompat bool, compatTranslationMap map[event
 func (t *Tracee) processEvents(ctx context.Context, in <-chan *trace.Event) (
 	<-chan *trace.Event, <-chan error,
 ) {
-	out := make(chan *trace.Event, 10000)
+	out := make(chan *trace.Event, t.config.PipelineChannelSize)
 	errc := make(chan error, 1)
 
 	// Some "informational" events are started here (TODO: API server?)
@@ -465,14 +459,8 @@ func (t *Tracee) processEvents(ctx context.Context, in <-chan *trace.Event) (
 				continue
 			}
 
-			policies, err := policy.Snapshots().Get(event.PoliciesVersion)
-			if err != nil {
-				t.handleError(err)
-				continue
-			}
-
 			// Get a bitmap with all policies containing container filters
-			policiesWithContainerFilter := policies.WithContainerFilterEnabled()
+			policiesWithContainerFilter := t.policyManager.WithContainerFilterEnabled()
 
 			// Filter out events that don't have a container ID from all the policies that
 			// have container filters. This will guarantee that any of those policies
@@ -521,7 +509,7 @@ func (t *Tracee) processEvents(ctx context.Context, in <-chan *trace.Event) (
 func (t *Tracee) deriveEvents(ctx context.Context, in <-chan *trace.Event) (
 	<-chan *trace.Event, <-chan error,
 ) {
-	out := make(chan *trace.Event)
+	out := make(chan *trace.Event, t.config.PipelineChannelSize)
 	errc := make(chan error, 1)
 
 	go func() {
@@ -616,13 +604,8 @@ func (t *Tracee) sinkEvents(ctx context.Context, in <-chan *trace.Event) <-chan 
 				continue
 			}
 
-			policies, err := policy.Snapshots().Get(event.PoliciesVersion)
-			if err != nil {
-				t.handleError(err)
-				continue
-			}
 			// Populate the event with the names of the matched policies.
-			event.MatchedPolicies = policies.MatchedNames(event.MatchedPoliciesUser)
+			event.MatchedPolicies = t.policyManager.MatchedNames(event.MatchedPoliciesUser)
 
 			// Parse args here if the rule engine is not enabled (parsed there if it is).
 			if !t.config.EngineConfig.Enabled {
@@ -655,7 +638,14 @@ func (t *Tracee) getStackAddresses(stackID uint32) []uint64 {
 	// Lookup the StackID in the map
 	// The ID could have aged out of the Map, as it only holds a finite number of
 	// Stack IDs in it's Map
-	stackBytes, err := t.StackAddressesMap.GetValue(unsafe.Pointer(&stackID))
+	var stackBytes []byte
+	err := capabilities.GetInstance().EBPF(func() error {
+		bytes, e := t.StackAddressesMap.GetValue(unsafe.Pointer(&stackID))
+		if e != nil {
+			stackBytes = bytes
+		}
+		return e
+	})
 	if err != nil {
 		logger.Debugw("failed to get StackAddress", "error", err)
 		return stackAddresses[0:0]
@@ -674,7 +664,12 @@ func (t *Tracee) getStackAddresses(stackID uint32) []uint64 {
 
 	// Attempt to remove the ID from the map so we don't fill it up
 	// But if this fails continue on
-	_ = t.StackAddressesMap.DeleteKey(unsafe.Pointer(&stackID))
+	err = capabilities.GetInstance().EBPF(func() error {
+		return t.StackAddressesMap.DeleteKey(unsafe.Pointer(&stackID))
+	})
+	if err != nil {
+		logger.Debugw("failed to delete stack address from eBPF map", "error", err)
+	}
 
 	return stackAddresses[0:stackCounter]
 }
@@ -732,7 +727,7 @@ func (t *Tracee) parseArguments(e *trace.Event) error {
 		}
 
 		if t.config.Output.ParseArgumentsFDs {
-			return events.ParseArgsFDs(e, uint64(t.getOrigEvtTimestamp(e)), t.FDArgPathMap)
+			return events.ParseArgsFDs(e, uint64(t.timeNormalizer.GetOriginalTime(e.Timestamp)), t.FDArgPathMap)
 		}
 	}
 

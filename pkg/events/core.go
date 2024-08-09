@@ -112,6 +112,7 @@ const (
 	ExecuteFinished
 	SecurityBprmCredsForExec
 	SecurityTaskSetrlimit
+	SecuritySettime64
 	MaxCommonID
 )
 
@@ -144,6 +145,7 @@ const (
 	SymbolsCollision
 	HiddenKernelModule
 	FtraceHook
+	TraceeInfo
 	MaxUserSpace
 )
 
@@ -11171,13 +11173,12 @@ var CoreEvents = map[ID]Definition{
 			{Type: "int", Name: "child_ns_pid"},
 			{Type: "unsigned long", Name: "start_time"}, // child_start_time
 			// Arguments set by OPT_PROCESS_FORK (when process tree source is enabled for fork events).
-			// These arguments are always removed after process tree processing.
-			// Up Parent (Up in hierarchy until parent is a process and not a lwp)
-			{Type: "int", Name: "up_parent_tid"},
-			{Type: "int", Name: "up_parent_ns_tid"},
-			{Type: "int", Name: "up_parent_pid"},
-			{Type: "int", Name: "up_parent_ns_pid"},
-			{Type: "unsigned long", Name: "up_parent_start_time"},
+			// Parent Process (Go up in hierarchy until parent is a process and not a lwp)
+			{Type: "int", Name: "parent_process_tid"},
+			{Type: "int", Name: "parent_process_ns_tid"},
+			{Type: "int", Name: "parent_process_pid"},
+			{Type: "int", Name: "parent_process_ns_pid"},
+			{Type: "unsigned long", Name: "parent_process_start_time"},
 			// Thread Group Leader
 			{Type: "int", Name: "leader_tid"},
 			{Type: "int", Name: "leader_ns_tid"},
@@ -11228,6 +11229,7 @@ var CoreEvents = map[ID]Definition{
 			{Type: "umode_t", Name: "stdin_type"},
 			{Type: "char*", Name: "stdin_path"},
 			{Type: "int", Name: "invoked_from_kernel"},
+			{Type: "const char*", Name: "prev_comm"},
 			{Type: "const char**", Name: "env"},
 		},
 	},
@@ -11914,6 +11916,19 @@ var CoreEvents = map[ID]Definition{
 			{Type: "u32", Name: "time_for_children"},
 			{Type: "u32", Name: "user"},
 			{Type: "u32", Name: "uts"},
+		},
+	},
+	TraceeInfo: {
+		id:           TraceeInfo,
+		id32Bit:      Sys32Undefined,
+		name:         "tracee_info",
+		version:      NewVersion(1, 0, 0),
+		sets:         []string{},
+		dependencies: Dependencies{},
+		params: []trace.ArgMeta{
+			{Type: "u64", Name: "boot_time"},
+			{Type: "u64", Name: "start_time"},
+			{Type: "const char*", Name: "version"},
 		},
 	},
 	SocketDup: {
@@ -12971,6 +12986,7 @@ var CoreEvents = map[ID]Definition{
 			probes: []Probe{
 				{handle: probes.ExecBinprm, required: false},
 				{handle: probes.ExecBinprmRet, required: false},
+				{handle: probes.SyscallEnter__Internal, required: true},
 			},
 			tailCalls: []TailCall{
 				{"prog_array", "trace_execute_failed1", []uint32{TailProcessExecuteFailed1}},
@@ -13073,6 +13089,23 @@ var CoreEvents = map[ID]Definition{
 			{Type: "u64", Name: "new_rlim_max"},
 		},
 	},
+	SecuritySettime64: {
+		id:      SecuritySettime64,
+		id32Bit: Sys32Undefined,
+		name:    "security_settime64",
+		dependencies: Dependencies{
+			probes: []Probe{
+				{handle: probes.SecuritySettime64, required: true},
+			},
+		},
+		sets: []string{"lsm"},
+		params: []trace.ArgMeta{
+			{Type: "u64", Name: "tv_sec"},
+			{Type: "u64", Name: "tv_nsec"},
+			{Type: "int", Name: "tz_minuteswest"},
+			{Type: "int", Name: "tz_dsttime"},
+		},
+	},
 	//
 	// Begin of Signal Events (Control Plane)
 	//
@@ -13135,12 +13168,12 @@ var CoreEvents = map[ID]Definition{
 			{Type: "int", Name: "child_pid"},
 			{Type: "int", Name: "child_ns_pid"},
 			{Type: "unsigned long", Name: "start_time"}, // child_start_time
-			// Up Parent (Up in hierarchy until parent is a process and not a lwp)
-			{Type: "int", Name: "up_parent_tid"},
-			{Type: "int", Name: "up_parent_ns_tid"},
-			{Type: "int", Name: "up_parent_pid"},
-			{Type: "int", Name: "up_parent_ns_pid"},
-			{Type: "unsigned long", Name: "up_parent_start_time"},
+			// Parent Process (Go up in hierarchy until parent is a process and not a lwp)
+			{Type: "int", Name: "parent_process_tid"},
+			{Type: "int", Name: "parent_process_ns_tid"},
+			{Type: "int", Name: "parent_process_pid"},
+			{Type: "int", Name: "parent_process_ns_pid"},
+			{Type: "unsigned long", Name: "parent_process_start_time"},
 			// Thread Group Leader
 			{Type: "int", Name: "leader_tid"},
 			{Type: "int", Name: "leader_ns_tid"},
